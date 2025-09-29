@@ -1,0 +1,82 @@
+from neuron import h, gui
+import matplotlib.pyplot as plt
+import numpy as np
+
+h.load_file("stdrun.hoc")
+
+# 1) Cell: single-compartment HH soma
+soma = h.Section(name="soma")
+soma.L = soma.diam = 20      # ~1256 µm² surface (sphere approx)
+soma.insert("hh")            # Hodgkin–Huxley channels
+soma.Ra = 100
+soma.cm  = 1
+
+# --- Synapse (ExpSyn) ---
+syn = h.ExpSyn(soma(0.5))
+#syn.tau1 = 1.0   # ms exponential opening constant 
+syn.tau= 10.0    # ms decay constant
+syn.e = 0.0      # mV (reversal, excitatory)
+
+# --- Presynaptic spike source ---
+ns = h.NetStim()
+ns.start = 10.0    # time of spike (ms)
+ns.number = 5     # how many spikes 
+ns.interval = 7   # delay between spikes, ignored with number=1
+ns.noise = 0
+
+# --- Connection: NetStim -> Synapse ---
+nc = h.NetCon(ns, syn)  #(source, target) in this the source is NetStim, and th target is the synapse
+nc.delay = 0.0            
+ #Notice here how it has 0 delay in transferrign the stim, this is because we use ExpSyn
+nc.weight[0] = 0.001  # μS (≈1 nS peak conductance)
+
+# 2) Current clamp 
+# stim = h.IClamp(soma(0.5))
+# stim.delay = 5.0   # ms
+# stim.dur = 1.0     # ms
+# stim.amp = 0.2     # nA
+
+# 3) Recording
+t = h.Vector().record(h._ref_t)
+v = h.Vector().record(soma(0.5)._ref_v)
+i_syn = h.Vector().record(syn._ref_i)  # synaptic current (nA)
+
+# 4) Run
+intervals = [20,7,3]
+results = []
+for iv in intervals:
+    ns.interval= iv
+    h.tstop = 100.0
+    h.dt = 0.025
+    h.finitialize(-65.0)
+    h.run()
+    results.append((iv, np.array(t), np.array(v), np.array(i_syn)))
+
+tA = np.array(t)
+vA = np.array(v)
+iA = np.array(i_syn)
+
+##########################Sngle Interval Pplot#####################
+# Voltage Trace
+plt.figure(figsize=(7,4))
+plt.plot(tA, vA)
+plt.xlabel("Time (ms)"); plt.ylabel("Membrane potential (mV)")
+plt.title("HH soma with Three EPSPs")
+plt.tight_layout(); plt.show()
+
+# Synaptic current Trace 
+plt.figure(figsize=(7,4))
+plt.plot(tA, iA)
+plt.xlabel("Time (ms)"); plt.ylabel("Synaptic current (nA)")
+plt.title("ExpSyn current")
+plt.tight_layout(); plt.show()
+
+# 5) Plot
+tA = np.array(t); vA = np.array(v)
+plt.figure(figsize=(7,4))
+plt.plot(tA, vA)
+plt.xlabel("Time (ms)")
+plt.ylabel("Membrane potential (mV)")
+plt.title("Baseline HH soma")
+plt.tight_layout()
+plt.show()
