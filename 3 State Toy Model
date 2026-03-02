@@ -154,31 +154,42 @@ def gaussian_log_likelihood(x: float, mean: float, std: float) -> float:
     var = std * std
     return -0.5 * ((x - mean) ** 2 / var + math.log(2.0 * math.pi * var))
 
-
 def build_time_varying_transition_matrices(
-    times: Sequence[float], glutamate: Sequence[float], params: NMDAMarkovParameters, dt: float
+    times: Sequence[float],
+    glutamate: Sequence[float],  # kept for signature compatibility; unused as per your design
+    params: NMDAMarkovParameters,
+    dt: float,
+    gate_mask: Sequence[bool],
 ) -> List[List[List[float]]]:
     matrices: List[List[List[float]]] = []
     for t_idx, _ in enumerate(times):
-        _glu = glutamate[t_idx]
         P_t = [[0.0 for _ in range(3)] for _ in range(3)]
 
-        rates = [params.k_open, params.k_desensitize]
-        total = sum(rates)
-        leave = min(0.99, total * dt)
-        P_t[0][0] = 1.0 - leave
-        P_t[0][1] = leave * (params.k_open / total)
-        P_t[0][2] = leave * (params.k_desensitize / total)
+        # --- C2 row (state 0) ---
+        if gate_mask[t_idx]:
+            total = params.k_open + params.k_desensitize
+            leave = min(0.99, total * dt)
+            P_t[0][0] = 1.0 - leave
+            P_t[0][1] = leave * (params.k_open / total)
+            P_t[0][2] = leave * (params.k_desensitize / total)
+        else:
+            leave = min(0.99, params.k_open * dt)
+            P_t[0][0] = 1.0 - leave
+            P_t[0][1] = leave
+            P_t[0][2] = 0.0
 
+        # --- O row (state 1): O -> C2 ---
         leave = min(0.99, params.k_close * dt)
         P_t[1][1] = 1.0 - leave
         P_t[1][0] = leave
 
+        # --- D row (state 2): D -> C2 ---
         leave = min(0.99, params.k_resensitize * dt)
         P_t[2][2] = 1.0 - leave
         P_t[2][0] = leave
 
         matrices.append(P_t)
+
     return matrices
 
 
@@ -250,7 +261,32 @@ def forward_time_varying(
             alpha[t][s] /= scale
 
     return alpha, sum(math.log(v) for v in scales)
+from collections import deque
 
+def compute_open_flags_from_obs(
+    observations: Sequence[float],
+    noise_std: float,
+    threshold_factor: float = 3.0,
+) -> List[int]:
+    """1 if observation looks open-like, else 0."""
+    thr = threshold_factor * noise_std
+    return [1 if abs(y) > thr else 0 for y in observations]
+
+def compute_gate_mask_from_open_flags(
+    open_flags: Sequence[int],
+    window_steps: int,
+    min_open_steps: int,
+) -> List[bool]:
+    """True when the C2->D branch is allowed at time t."""
+    q: Deque[int] = deque()
+    s = 0
+    gate: List[bool] = []
+    for f in open_flags:
+        q.append(f); s += f
+        if len(q) > window_steps:
+            s -= q.popleft()
+        gate.append(s >= min_open_steps)
+    return gate
 
 def viterbi_time_varying_contextual(
     observations: Sequence[float],
@@ -258,8 +294,6 @@ def viterbi_time_varying_contextual(
     transition_matrices: Sequence[Sequence[Sequence[float]]],
     emission_means: Sequence[float],
     emission_stds: Sequence[float],
-    d_from_c2_window_steps: int,
-    d_from_c2_min_open_steps: int,
     tau_puff: Sequence[float],
     tau_open: Sequence[float],
     context_penalty_strength: float,
@@ -285,21 +319,6 @@ def viterbi_time_varying_contextual(
     log_delta = [[float("-inf")] * n_states for _ in range(n_obs)]
     psi = [[0] * n_states for _ in range(n_obs)]
 
-    def recent_open_count_for_extension(t_idx: int, prev_state: int, next_state: int) -> int:
-        count = 1 if next_state == o_state_index else 0
-        back_t = t_idx - 1
-        back_state = prev_state
-        looked = 1
-        while back_t >= 0 and looked < d_from_c2_window_steps:
-            if back_state == o_state_index:
-                count += 1
-            if back_t == 0:
-                break
-            back_state = psi[back_t][back_state]
-            back_t -= 1
-            looked += 1
-        return count
-
     for s in range(n_states):
         log_delta[0][s] = log_start[s] + gaussian_log_likelihood(observations[0], emission_means[s], emission_stds[s])
 
@@ -311,22 +330,9 @@ def viterbi_time_varying_contextual(
             best = float("-inf")
             best_prev = 0
             for prev in range(n_states):
-                recent_open_count = recent_open_count_for_extension(t, prev, s)
-
-                # D gate: disallow C2 -> D unless recent O occupancy in sliding window is high enough.
-                if prev == c2_state_index and s == d_state_index:
-                    if recent_open_count < d_from_c2_min_open_steps:
-                        continue
 
                 p_trans = max(P_prev[prev][s], 1e-12)
                 candidate = log_delta[t - 1][prev] + math.log(p_trans)
-
-                # Contextual D persistence penalty (no dwell-time penalty).
-                if prev == s == d_state_index:
-                    excess_puff = max(0.0, (tau_puff[t] - puff_grace) / puff_scale)
-                    excess_open = max(0.0, (tau_open[t] - open_grace) / open_scale)
-                    candidate += -context_penalty_strength * (excess_puff + excess_open)
-
                 candidate += gaussian_log_likelihood(y, emission_means[s], emission_stds[s])
 
                 if candidate > best:
@@ -391,21 +397,31 @@ def main() -> None:
 
     emission_means = [g * (synapse.v_hold - synapse.e_rev) * 1000.0 for g in synapse.g_states]
     emission_stds = [synapse.observation_noise_std for _ in range(n_states)]
-    transition_matrices = build_time_varying_transition_matrices(times, glutamate, synapse.params, synapse.dt)
+
+# --- Gate computed from decoder-side "open-like" observations ---
+    open_flags = compute_open_flags_from_obs(noisy_current, synapse.observation_noise_std)
+
+    d_from_c2_window_steps = max(1, int(round(params.d_from_c2_window_ms / dt)))
+    d_from_c2_min_open_steps = max(1, int(round(params.d_from_c2_min_open_time_ms / dt)))
+
+    gate_mask = compute_gate_mask_from_open_flags(
+    open_flags,
+    window_steps=d_from_c2_window_steps,
+    min_open_steps=d_from_c2_min_open_steps,
+)  
+
+    transition_matrices = build_time_varying_transition_matrices(times, glutamate, synapse.params, synapse.dt, gate_mask=gate_mask)
 
     tau_puff = compute_time_since_puff(times, synapse.release_times)
     tau_open = compute_time_since_open_obs(times, noisy_current, synapse.observation_noise_std)
 
-    d_from_c2_window_steps = max(1, int(round(params.d_from_c2_window_ms / dt)))
-    d_from_c2_min_open_steps = max(1, int(round(params.d_from_c2_min_open_time_ms / dt)))
+
     inferred_states = viterbi_time_varying_contextual(
         noisy_current,
         start_prob,
         transition_matrices,
         emission_means,
         emission_stds,
-        d_from_c2_window_steps=d_from_c2_window_steps,
-        d_from_c2_min_open_steps=d_from_c2_min_open_steps,
         tau_puff=tau_puff,
         tau_open=tau_open,
         context_penalty_strength=params.context_penalty_strength,
