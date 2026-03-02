@@ -1,0 +1,488 @@
+from __future__ import annotations
+
+import math
+import random
+from collections import deque
+from dataclasses import dataclass
+from typing import Deque, List, Sequence, Tuple
+
+try:
+    import matplotlib.pyplot as plt
+except ImportError:
+    plt = None
+
+
+StateIndex = int
+
+
+@dataclass
+class NMDAMarkovParameters:
+    """3-state toy model parameters derived from the original 5-state core.
+
+    State mapping:
+        0: C2
+        1: O
+        2: D
+    """
+
+    k_open: float = 0.0465
+    k_close: float = 0.0916
+    k_desensitize: float = 0.0084
+    k_resensitize: float = 0.0018
+
+    # D gate: require enough recent O occupancy inside a sliding window
+    d_from_c2_window_ms: float = 20.0
+    d_from_c2_min_open_time_ms: float = 2.0
+
+    # Context-sensitive penalty for over-persistent D occupancy
+    context_penalty_strength: float = 0.0
+    puff_grace_ms: float = 100.0
+    open_grace_ms: float = 100.0
+    puff_scale_ms: float = 200.0
+    open_scale_ms: float = 200.0
+
+
+class NMDAMarkovSynapse:
+    state_labels: Tuple[str, ...] = ("C2", "O", "D")
+
+    def __init__(
+        self,
+        release_times: Sequence[float],
+        *,
+        dt: float = 0.05,
+        params: NMDAMarkovParameters | None = None,
+        g_open: float = 5e-5,
+        e_rev: float = 0.0,
+        v_hold: float = -55.0,
+        glutamate_peak: float = 1200.0,
+        glutamate_tau: float = 1.2,
+        observation_noise_std: float = 0.35,
+        rng: random.Random | None = None,
+    ) -> None:
+        self.release_times = [float(t) for t in release_times]
+        self.dt = dt
+        self.params = params or NMDAMarkovParameters()
+        self.g_states = [0.0, g_open, 0.0]
+        self.e_rev = e_rev
+        self.v_hold = v_hold
+        self.glutamate_peak = glutamate_peak
+        self.glutamate_tau = glutamate_tau
+        self.observation_noise_std = observation_noise_std
+        self.rng = rng or random.Random(42)
+
+        self.state: StateIndex = 0
+        self._state_history: List[StateIndex] = []
+        self._current_history: List[float] = []
+        self._glutamate_history: List[float] = []
+        self._open_window_flags: Deque[int] = deque()
+        self._open_window_sum: int = 0
+
+    def glutamate_concentration(self, t: float) -> float:
+        total = 0.0
+        for release in self.release_times:
+            if t >= release:
+                total += self.glutamate_peak * math.exp(-(t - release) / self.glutamate_tau)
+        return total
+
+    def _transition_rates(self, state: StateIndex, _glu: float) -> Tuple[Sequence[StateIndex], List[float]]:
+        p = self.params
+        d_gate_min_open_steps = max(1, int(round(p.d_from_c2_min_open_time_ms / self.dt)))
+
+        if state == 0:  # C2 -> {O, D}; C2 -> C1 removed
+            if self._open_window_sum >= d_gate_min_open_steps:
+                return (1, 2), [p.k_open, p.k_desensitize]
+            return (1,), [p.k_open]
+        if state == 1:  # O -> C2
+            return (0,), [p.k_close]
+        if state == 2:  # D -> C2
+            return (0,), [p.k_resensitize]
+        raise ValueError(f"Invalid state index: {state}")
+
+    def _maybe_transition(self, glutamate: float) -> None:
+        targets, rates = self._transition_rates(self.state, glutamate)
+        total_rate = sum(rates)
+        if total_rate <= 0.0:
+            return
+
+        leave_prob = min(0.99, total_rate * self.dt)
+        if self.rng.random() < leave_prob:
+            r = self.rng.random()
+            cumulative = 0.0
+            for target, rate in zip(targets, rates):
+                cumulative += rate / total_rate
+                if r <= cumulative:
+                    self.state = target
+                    break
+
+    def step(self, t: float) -> None:
+        glutamate = self.glutamate_concentration(t)
+        self._maybe_transition(glutamate)
+
+        window_steps = max(1, int(round(self.params.d_from_c2_window_ms / self.dt)))
+        is_open = 1 if self.state == 1 else 0
+        self._open_window_flags.append(is_open)
+        self._open_window_sum += is_open
+        if len(self._open_window_flags) > window_steps:
+            self._open_window_sum -= self._open_window_flags.popleft()
+        current = self.g_states[self.state] * (self.v_hold - self.e_rev) * 1000.0
+        self._state_history.append(self.state)
+        self._current_history.append(current)
+        self._glutamate_history.append(glutamate)
+
+    def simulate(self, t_stop: float) -> Tuple[List[float], List[int], List[float]]:
+        self._state_history.clear()
+        self._current_history.clear()
+        self._glutamate_history.clear()
+        self._open_window_flags.clear()
+        self._open_window_sum = 0
+        self.state = 0  # Start in C2 by construction
+
+        steps = int(math.ceil(t_stop / self.dt))
+        times = [self.dt * i for i in range(steps)]
+        for t in times:
+            self.step(t)
+        return times, list(self._state_history), list(self._current_history)
+
+    def glutamate_trace(self) -> List[float]:
+        return list(self._glutamate_history)
+
+    def noisy_current(self) -> List[float]:
+        return [v + self.rng.gauss(0.0, self.observation_noise_std) for v in self._current_history]
+
+
+def gaussian_log_likelihood(x: float, mean: float, std: float) -> float:
+    var = std * std
+    return -0.5 * ((x - mean) ** 2 / var + math.log(2.0 * math.pi * var))
+
+
+def build_time_varying_transition_matrices(
+    times: Sequence[float], glutamate: Sequence[float], params: NMDAMarkovParameters, dt: float
+) -> List[List[List[float]]]:
+    matrices: List[List[List[float]]] = []
+    for t_idx, _ in enumerate(times):
+        _glu = glutamate[t_idx]
+        P_t = [[0.0 for _ in range(3)] for _ in range(3)]
+
+        rates = [params.k_open, params.k_desensitize]
+        total = sum(rates)
+        leave = min(0.99, total * dt)
+        P_t[0][0] = 1.0 - leave
+        P_t[0][1] = leave * (params.k_open / total)
+        P_t[0][2] = leave * (params.k_desensitize / total)
+
+        leave = min(0.99, params.k_close * dt)
+        P_t[1][1] = 1.0 - leave
+        P_t[1][0] = leave
+
+        leave = min(0.99, params.k_resensitize * dt)
+        P_t[2][2] = 1.0 - leave
+        P_t[2][0] = leave
+
+        matrices.append(P_t)
+    return matrices
+
+
+def compute_time_since_puff(times: Sequence[float], release_times: Sequence[float]) -> List[float]:
+    tau_puff: List[float] = []
+    last_puff_time = -1e9
+    idx_rel = 0
+    rel_sorted = sorted(release_times)
+
+    for t in times:
+        while idx_rel < len(rel_sorted) and rel_sorted[idx_rel] <= t:
+            last_puff_time = rel_sorted[idx_rel]
+            idx_rel += 1
+        tau_puff.append(0.0 if last_puff_time < -1e8 else t - last_puff_time)
+
+    return tau_puff
+
+
+def compute_time_since_open_obs(
+    times: Sequence[float], observations: Sequence[float], noise_std: float, threshold_factor: float = 3.0
+) -> List[float]:
+    tau_open: List[float] = []
+    last_open_time = -1e9
+    thr = threshold_factor * noise_std
+
+    for t, y in zip(times, observations):
+        if abs(y) > thr:
+            last_open_time = t
+        tau_open.append(0.0 if last_open_time < -1e8 else t - last_open_time)
+
+    return tau_open
+
+
+def forward_time_varying(
+    observations: Sequence[float],
+    start_prob: Sequence[float],
+    transition_matrices: Sequence[Sequence[Sequence[float]]],
+    emission_means: Sequence[float],
+    emission_stds: Sequence[float],
+) -> Tuple[List[List[float]], float]:
+    n_obs = len(observations)
+    n_states = len(start_prob)
+
+    alpha = [[0.0] * n_states for _ in range(n_obs)]
+    scales = [0.0] * n_obs
+
+    for s in range(n_states):
+        emission = math.exp(gaussian_log_likelihood(observations[0], emission_means[s], emission_stds[s]))
+        alpha[0][s] = start_prob[s] * emission
+
+    scale0 = sum(alpha[0]) or 1e-300
+    scales[0] = scale0
+    for s in range(n_states):
+        alpha[0][s] /= scale0
+
+    for t in range(1, n_obs):
+        P_prev = transition_matrices[t - 1]
+        y = observations[t]
+        for s in range(n_states):
+            trans_sum = 0.0
+            for prev in range(n_states):
+                trans_sum += alpha[t - 1][prev] * P_prev[prev][s]
+            emission = math.exp(gaussian_log_likelihood(y, emission_means[s], emission_stds[s]))
+            alpha[t][s] = emission * trans_sum
+
+        scale = sum(alpha[t]) or 1e-300
+        scales[t] = scale
+        for s in range(n_states):
+            alpha[t][s] /= scale
+
+    return alpha, sum(math.log(v) for v in scales)
+
+
+def viterbi_time_varying_contextual(
+    observations: Sequence[float],
+    start_prob: Sequence[float],
+    transition_matrices: Sequence[Sequence[Sequence[float]]],
+    emission_means: Sequence[float],
+    emission_stds: Sequence[float],
+    d_from_c2_window_steps: int,
+    d_from_c2_min_open_steps: int,
+    tau_puff: Sequence[float],
+    tau_open: Sequence[float],
+    context_penalty_strength: float,
+    puff_grace: float,
+    open_grace: float,
+    puff_scale: float,
+    open_scale: float,
+    c2_state_index: int = 0,
+    o_state_index: int = 1,
+    d_state_index: int = 2,
+) -> List[int]:
+    """Context-sensitive semi-Markov Viterbi without dwell-time penalty.
+
+    Includes:
+      - time-varying transition matrices (glu-driven)
+      - context penalty for over-persistent D occupancy
+      - D gate disallowing C2->D unless recent inferred O occupancy is high enough
+    """
+    n_obs = len(observations)
+    n_states = len(start_prob)
+
+    log_start = [math.log(max(p, 1e-12)) for p in start_prob]
+    log_delta = [[float("-inf")] * n_states for _ in range(n_obs)]
+    psi = [[0] * n_states for _ in range(n_obs)]
+
+    def recent_open_count_for_extension(t_idx: int, prev_state: int, next_state: int) -> int:
+        count = 1 if next_state == o_state_index else 0
+        back_t = t_idx - 1
+        back_state = prev_state
+        looked = 1
+        while back_t >= 0 and looked < d_from_c2_window_steps:
+            if back_state == o_state_index:
+                count += 1
+            if back_t == 0:
+                break
+            back_state = psi[back_t][back_state]
+            back_t -= 1
+            looked += 1
+        return count
+
+    for s in range(n_states):
+        log_delta[0][s] = log_start[s] + gaussian_log_likelihood(observations[0], emission_means[s], emission_stds[s])
+
+    for t in range(1, n_obs):
+        P_prev = transition_matrices[t - 1]
+        y = observations[t]
+
+        for s in range(n_states):
+            best = float("-inf")
+            best_prev = 0
+            for prev in range(n_states):
+                recent_open_count = recent_open_count_for_extension(t, prev, s)
+
+                # D gate: disallow C2 -> D unless recent O occupancy in sliding window is high enough.
+                if prev == c2_state_index and s == d_state_index:
+                    if recent_open_count < d_from_c2_min_open_steps:
+                        continue
+
+                p_trans = max(P_prev[prev][s], 1e-12)
+                candidate = log_delta[t - 1][prev] + math.log(p_trans)
+
+                # Contextual D persistence penalty (no dwell-time penalty).
+                if prev == s == d_state_index:
+                    excess_puff = max(0.0, (tau_puff[t] - puff_grace) / puff_scale)
+                    excess_open = max(0.0, (tau_open[t] - open_grace) / open_scale)
+                    candidate += -context_penalty_strength * (excess_puff + excess_open)
+
+                candidate += gaussian_log_likelihood(y, emission_means[s], emission_stds[s])
+
+                if candidate > best:
+                    best = candidate
+                    best_prev = prev
+
+            log_delta[t][s] = best
+            psi[t][s] = best_prev
+
+    last_state = max(range(n_states), key=lambda s: log_delta[-1][s])
+    states = [last_state]
+    for t in range(n_obs - 1, 0, -1):
+        states.insert(0, psi[t][states[0]])
+    return states
+
+
+def plot_confusion_matrix(confusion: Sequence[Sequence[int]], labels: Sequence[str], title: str) -> None:
+    if plt is None:
+        return
+
+    fig, ax = plt.subplots(figsize=(5.5, 4.5))
+    im = ax.imshow(confusion, cmap="viridis", aspect="auto")
+    ax.set_title(title)
+    ax.set_xlabel("Inferred state")
+    ax.set_ylabel("True state")
+    ax.set_xticks(range(len(labels)))
+    ax.set_yticks(range(len(labels)))
+    ax.set_xticklabels(labels)
+    ax.set_yticklabels(labels)
+
+    for i in range(len(labels)):
+        for j in range(len(labels)):
+            ax.text(j, i, int(confusion[i][j]), ha="center", va="center", color="white")
+
+    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    fig.tight_layout()
+    plt.show()
+
+
+def main() -> None:
+    dt = 0.05
+    release_times = [50.0, 75, 100, 175, 800]
+    t_stop = 900.0
+
+    params = NMDAMarkovParameters(d_from_c2_window_ms=20.0, d_from_c2_min_open_time_ms=2.0)
+    synapse = NMDAMarkovSynapse(
+        release_times,
+        dt=dt,
+        params=params,
+        v_hold=-50.0,
+        observation_noise_std=0.35,
+        rng=random.Random(12),
+    )
+
+    times, true_states, clean_current = synapse.simulate(t_stop)
+    glutamate = synapse.glutamate_trace()
+    noisy_current = synapse.noisy_current()
+
+    n_states = len(synapse.state_labels)
+    start_prob = [1e-6] * n_states
+    start_prob[0] = 1.0 - (n_states - 1) * 1e-6
+
+    emission_means = [g * (synapse.v_hold - synapse.e_rev) * 1000.0 for g in synapse.g_states]
+    emission_stds = [synapse.observation_noise_std for _ in range(n_states)]
+    transition_matrices = build_time_varying_transition_matrices(times, glutamate, synapse.params, synapse.dt)
+
+    tau_puff = compute_time_since_puff(times, synapse.release_times)
+    tau_open = compute_time_since_open_obs(times, noisy_current, synapse.observation_noise_std)
+
+    d_from_c2_window_steps = max(1, int(round(params.d_from_c2_window_ms / dt)))
+    d_from_c2_min_open_steps = max(1, int(round(params.d_from_c2_min_open_time_ms / dt)))
+    inferred_states = viterbi_time_varying_contextual(
+        noisy_current,
+        start_prob,
+        transition_matrices,
+        emission_means,
+        emission_stds,
+        d_from_c2_window_steps=d_from_c2_window_steps,
+        d_from_c2_min_open_steps=d_from_c2_min_open_steps,
+        tau_puff=tau_puff,
+        tau_open=tau_open,
+        context_penalty_strength=params.context_penalty_strength,
+        puff_grace=params.puff_grace_ms,
+        open_grace=params.open_grace_ms,
+        puff_scale=params.puff_scale_ms,
+        open_scale=params.open_scale_ms,
+    )
+
+    print(
+        f"D-gate config to decoder: window={d_from_c2_window_steps} steps, "
+        f"min_open={d_from_c2_min_open_steps} steps"
+    )
+
+    alpha, log_likelihood = forward_time_varying(
+        noisy_current,
+        start_prob,
+        transition_matrices,
+        emission_means,
+        emission_stds,
+    )
+    forward_states = [max(range(n_states), key=lambda s: alpha_t[s]) for alpha_t in alpha]
+
+    acc_v = sum(1 for a, b in zip(inferred_states, true_states) if a == b) / len(true_states)
+    acc_f = sum(1 for a, b in zip(forward_states, true_states) if a == b) / len(true_states)
+
+    print(f"Viterbi state accuracy: {acc_v * 100:.2f}%")
+    print(f"Forward MAP state accuracy: {acc_f * 100:.2f}%")
+    print(f"Sequence log-likelihood (forward): {log_likelihood:.3f}")
+
+    confusion_v = [[0 for _ in range(n_states)] for _ in range(n_states)]
+    for true_s, inf_s in zip(true_states, inferred_states):
+        confusion_v[true_s][inf_s] += 1
+
+    confusion_f = [[0 for _ in range(n_states)] for _ in range(n_states)]
+    for true_s, inf_s in zip(true_states, forward_states):
+        confusion_f[true_s][inf_s] += 1
+
+    print("\nConfusion matrix - Viterbi (rows=true, cols=inferred):")
+    print("         " + " ".join(f"{lab:>5s}" for lab in synapse.state_labels))
+    for i, row in enumerate(confusion_v):
+        print(f"{synapse.state_labels[i]:>5s} | " + " ".join(f"{v:5d}" for v in row))
+
+    print("\nConfusion matrix - Forward MAP (rows=true, cols=inferred):")
+    print("         " + " ".join(f"{lab:>5s}" for lab in synapse.state_labels))
+    for i, row in enumerate(confusion_f):
+        print(f"{synapse.state_labels[i]:>5s} | " + " ".join(f"{v:5d}" for v in row))
+
+    if plt is None:
+        return
+
+    fig, axes = plt.subplots(4, 1, figsize=(12, 9), sharex=True)
+    axes[0].plot(times, glutamate)
+    axes[0].set_ylabel("[Glu] (uM)")
+    axes[0].set_title("Glutamate")
+
+    axes[1].plot(times, clean_current, label="Clean")
+    axes[1].plot(times, noisy_current, label="Noisy", alpha=0.6)
+    axes[1].set_ylabel("Current (pA)")
+    axes[1].legend(loc="upper right")
+
+    axes[2].plot(times, true_states, drawstyle="steps-pre")
+    axes[2].set_ylabel("True")
+    axes[2].set_yticks(range(n_states))
+    axes[2].set_yticklabels(synapse.state_labels)
+
+    axes[3].plot(times, inferred_states, drawstyle="steps-pre")
+    axes[3].set_ylabel("Viterbi")
+    axes[3].set_yticks(range(n_states))
+    axes[3].set_yticklabels(synapse.state_labels)
+    axes[3].set_xlabel("Time (ms)")
+
+    fig.tight_layout()
+    plt.show()
+    plot_confusion_matrix(confusion_v, synapse.state_labels, "Confusion Matrix (Viterbi)")
+    plot_confusion_matrix(confusion_f, synapse.state_labels, "Confusion Matrix (Forward MAP)")
+
+
+if __name__ == "__main__":
+    main()
